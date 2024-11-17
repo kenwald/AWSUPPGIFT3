@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack
+
+
+#DynamoDB table
+Resources:
+  DBTABLE:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Contacts
+      AttributeDefinitions:
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: timestamp
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+
+
+
+ 
+ # Skapa Lambda-funktion för att lägga till kontaktinfo
+  CONTACTINFO:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CONTACTINFO
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LAMBDAROLETOACESSDYNAMODB.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          def lambda_handler(event, context):
+              db = boto3.resource('dynamodb')
+              table = db.Table('Contacts')
+              dateTime = (datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+              try:
+                  payload = json.loads(event['body'])
+                  table.put_item(
+                      Item={
+                          'timestamp': dateTime,
+                          'name': payload['name'],
+                          'email': payload['email'],
+                          'message': payload['msg']
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully saved contact info!'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Credentials": True,
+                      }
+                  }
+              except:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Error saving contact info'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Credentials": True,
+                      }
+                  }
+  # Skapa Lambda-funktion för epost
+  EMAILCONTACTINFO:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EMAILCONTACTINFO
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LAMBDAROLETOACESSSES.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          # Initialize the DynamoDB client
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('Contacts')  # Replace with your DynamoDB table name
+          def lambda_handler(event, context):
+              # Scan the DynamoDB table
+              result = table.scan()
+              items = result['Items']
+              ses = boto3.client('ses')
+              body = f"""
+                  Contact Information:
+                  {items}
+                  """
+              ses.send_email(
+                  Source = 'kenoje89@outlook.com',
+                  Destination = {
+                      'ToAddresses': [
+                          'kenoje89@gmail.com'
+                      ]
+                  },
+                  Message = {
+                      'Subject': {
+                          'Data': 'Contact Info Notification',
+                          'Charset': 'UTF-8'
+                      },
+                      'Body': {
+                          'Text':{
+                              'Data': body,
+                              'Charset': 'UTF-8'
+                          }
+                      }
+                  }
+              )
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Successfully sent email from Lambda using Amazon SES')
+              }
+
+# API Gateway
+  API:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: API
+
+
+#Skapa endpoint
+  CONTACTRESOURCE:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt API.RootResourceId
+      PathPart: addContact
+      RestApiId: !Ref API
+
+#Öppna HTTP, sätter POST som metod för Lambda
+  ContactPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      ResourceId: !Ref CONTACTRESOURCE
+      RestApiId: !Ref API
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt CONTACTINFO.Arn
+    
+    # Aktiverar CORS
+
+  CORS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref CONTACTRESOURCE
+      RestApiId: !Ref API
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'''
+              method.response.header.Access-Control-Allow-Methods: '''OPTIONS,POST,GET'''
+              method.response.header.Access-Control-Allow-Origin: '''*'''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+ 
+ # Ge API-gateway åtkomst till lambda funktionen
+  APIPERMISSION:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CONTACTINFO
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${API}/*
+# Distribuera till prod stadie, skapar efter att method skapas
+  APIDEPLOY:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ContactPostMethod
+    Properties:
+      RestApiId: !Ref API
+      StageName: prod 
+# S3 Bucket
+  S3BUCKET:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub contacts-${AWS::Region}-${AWS::AccountId}-${AWS::StackName}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # Policy för S3 bucket
+  S3BUCKETPOLICY:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BUCKET
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicAccessGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${S3BUCKET}/*
+
+
+
+# IAM-Roll acess dynamoDB
+  LAMBDAROLETOACESSDYNAMODB:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LAMBDAROLETOACESSDYNAMODB
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+# IAM-Roll acess ses
+  LAMBDAROLETOACESSSES:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LAMBDAROLETOACESSSES
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBFullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:*
+                Resource: '*'
+        - PolicyName: SESFullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ses:*
+                Resource: '*'
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+#Sätter DynamoDB som trigger för SES-lambdafunktion
+  DYNAMODBCONTACTTRIGGER:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 5 
+      EventSourceArn: !GetAtt DBTABLE.StreamArn
+      FunctionName: !Ref EMAILCONTACTINFO
+      Enabled: true
+      StartingPosition: LATEST 
+#Ge dynamoDB rättighet att trigga
+  DYNAMODBTRIGGERPERMISSION:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EMAILCONTACTINFO
+      Action: lambda:InvokeFunction
+      Principal: dynamodb.amazonaws.com
+      SourceArn: !GetAtt DBTABLE.StreamArn
+
